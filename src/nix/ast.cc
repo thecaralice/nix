@@ -153,11 +153,13 @@ struct CmdAst : SourceExprCommand
     }
     std::string description() override
     {
-        return "todo";
+        return "show a JSON representation of a Nix expression";
     }
     std::string doc() override
     {
-        return "todo";
+        return
+#include "ast.md"
+            ;
     }
     void run(ref<Store>) override
     {
@@ -268,6 +270,9 @@ void to_json(json & j, const WithSymbols<ExprVar> & expr)
     j = json{
         {"kind", "Var"},
         {"name", expr.map([](auto x) { return x.name; })},
+        {"from_with", expr.map([](auto && x) { return x.fromWith; })},
+        {"level", expr->level},
+        {"displacement", expr->displ},
     };
 }
 
@@ -282,11 +287,10 @@ void to_json(json & j, const WithSymbols<AttrName> & attr)
 
 void to_json(json & j, const WithSymbols<ExprAttrs::AttrDef> & expr)
 {
-    if (expr->inherited) {
-        j = "inherit";
-    } else {
-        j = {"value", expr.map([](auto && x) { return x.e; })};
-    }
+    j = {
+        {"inherited", expr->inherited},
+        {"value", expr.map([](auto && x) { return x.e; })},
+    };
 }
 
 void to_json(json & j, const WithSymbols<ExprSelect> & expr)
@@ -488,7 +492,7 @@ to_json(json & j, const WithSymbols<E> & expr)
 }
 
 template<typename E>
-void to_json(json & j, const WithSymbols<E *>& expr)
+void to_json(json & j, const WithSymbols<E *> & expr)
 {
     if (!*expr) {
         return;
