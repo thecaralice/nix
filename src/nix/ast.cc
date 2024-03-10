@@ -12,9 +12,12 @@
 
 #include <functional>
 #include <nlohmann/json.hpp>
+#include <sstream>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <typeinfo>
 
 using namespace nix;
 using json = nlohmann::json;
@@ -26,7 +29,12 @@ auto dyn_to_variant(const P * dyn) -> V
         std::optional<V> res;
         ((dynamic_cast<const Ts *>(dyn) ? (res = std::reference_wrapper<Ts>{*static_cast<const Ts *>(dyn)}, 0) : 0),
          ...);
-        return *res;
+        if (res) {
+            return *res;
+        }
+        std::stringstream err;
+        err << "Unable to read pointer " << dyn << "(typeid: " << typeid(*dyn).name() << ")";
+        throw std::runtime_error(err.str());
     }(std::type_identity<V>{});
 };
 using expr_variant = std::variant<
@@ -64,41 +72,78 @@ struct WithSymbols
 
     // fmap aka <$>
     template<typename F>
-    constexpr auto map(F func) const
-    {
-        return WithSymbols<std::invoke_result_t<F, E>>{
-            .value = func(this->value),
-            .table = this->table,
-        };
-    }
+    constexpr inline auto map(F func) const;
 
     // $>
     template<typename B>
-    constexpr auto replace(B value) const
-    {
-        return this->map([value](auto) { return value; });
-    }
+    constexpr auto replace(B value) const;
 
-    const E * operator->() const
-    {
-        return &this->value;
-    }
-
-    E operator*() const
-    {
-        return this->value;
-    }
-
-    operator std::string() const;
+    constexpr inline const E * operator->() const;
+    constexpr inline const E & operator*() const;
 };
 
 template<>
-WithSymbols<Symbol>::operator std::string() const
+struct WithSymbols<Symbol>
 {
-    return this->table[this->value];
+    Symbol value;
+    const SymbolTable & table;
+
+    // fmap aka <$>
+    template<typename F>
+    constexpr inline auto map(F func) const;
+
+    // $>
+    template<typename B>
+    constexpr auto replace(B value) const;
+
+    constexpr inline const Symbol * operator->() const;
+    constexpr inline const Symbol & operator*() const;
+    inline std::optional<std::string_view> resolve() const
+    {
+        return this->value ? std::make_optional(this->table[this->value]) : std::nullopt;
+    }
+
+    constexpr inline operator std::string_view() const
+    {
+        return *this->resolve();
+    }
+    constexpr inline operator std::string() const
+    {
+        std::string_view str = *this;
+        return std::string(str);
+    }
+};
+
+template<typename E>
+template<typename F>
+constexpr inline auto WithSymbols<E>::map(F func) const
+{
+    return WithSymbols<std::invoke_result_t<F, E>>{
+        .value = func(this->value),
+        .table = this->table,
+    };
 }
 
-void to_json(json & j, const WithSymbols<Expr *> & expr);
+template<typename E>
+template<typename B>
+constexpr inline auto WithSymbols<E>::replace(B value) const
+{
+    return this->map([value](auto) { return value; });
+}
+template<typename E>
+constexpr inline const E * WithSymbols<E>::operator->() const
+{
+    return &this->value;
+}
+
+template<typename E>
+constexpr inline const E & WithSymbols<E>::operator*() const
+{
+    return this->value;
+}
+
+template<typename E>
+void to_json(json & j, const WithSymbols<E *> & expr);
 struct CmdAst : SourceExprCommand
 {
     CmdAst() {}
@@ -116,6 +161,7 @@ struct CmdAst : SourceExprCommand
     }
     void run(ref<Store>) override
     {
+        evalSettings.pureEval = false;
         auto eval_state = getEvalState();
         if (this->expr && this->file) {
             throw UsageError("`--file` and `--expr` are mutually exclusive");
@@ -125,7 +171,6 @@ struct CmdAst : SourceExprCommand
         }
         Expr * expr;
         if (this->file) {
-            evalSettings.pureEval = false;
             expr = eval_state->parseExprFromFile(eval_state->rootPath(CanonPath::fromCwd(this->file.value())));
         } else {
             expr = eval_state->parseExprFromString(
@@ -172,7 +217,12 @@ void to_json(json & j, const ExprPath & expr)
 }
 void to_json(json & j, const WithSymbols<Symbol> & sym)
 {
-    j = sym.table[sym.value];
+    if (auto s = sym.resolve()) {
+        std::string_view str = *s;
+        j = str;
+    } else {
+        j = json();
+    }
 }
 
 template<typename T>
@@ -245,10 +295,7 @@ void to_json(json & j, const WithSymbols<ExprSelect> & expr)
         {"kind", "Select"},
         {"from", expr.map([](auto && x) { return x.e; })},
         {"path", expr.map([](auto && x) { return x.attrPath; })},
-    };
-    if (expr.value.def) {
-        j["default"] = expr.map([](auto && x) { return x.def; });
-    }
+        {"default", expr.map([](auto && x) { return x.def; })}};
 }
 
 void to_json(json & j, const WithSymbols<ExprOpHasAttr> & expr)
@@ -280,7 +327,10 @@ void to_json(json & j, const WithSymbols<ExprAttrs> & expr)
 }
 void to_json(json & j, const WithSymbols<ExprList> & expr)
 {
-    j = {{"kind", "List"}, {"value", expr.map([](auto && x) { return x.elems; })}};
+    j = {
+        {"kind", "List"},
+        {"value", expr.map([](auto && x) { return x.elems; })},
+    };
 }
 
 void to_json(json & j, const WithSymbols<Formal> & formal)
@@ -306,10 +356,8 @@ void to_json(json & j, const WithSymbols<ExprLambda> & expr)
         {"name", expr.map([](auto && x) { return x.name; })},
         {"arg", expr.map([](auto && x) { return x.arg; })},
         {"body", expr.map([](auto && x) { return x.body; })},
+        {"formals", expr.map([](auto && x) { return x.formals; })},
     };
-    if (expr->hasFormals()) {
-        j["formals"] = expr.map([](auto && x) { return *x.formals; });
-    }
 }
 void to_json(json & j, const WithSymbols<ExprCall> & expr)
 {
@@ -439,8 +487,21 @@ to_json(json & j, const WithSymbols<E> & expr)
     return to_json(j, expr.value);
 }
 
+template<typename E>
+void to_json(json & j, const WithSymbols<E *>& expr)
+{
+    if (!*expr) {
+        return;
+    }
+    j = expr.map([](auto && x) { return *x; });
+}
+
+template<>
 void to_json(json & j, const WithSymbols<Expr *> & expr)
 {
+    if (!*expr) {
+        return;
+    }
     std::visit(
         [&expr, &j](auto && x) {
             using T = std::decay_t<decltype(x)>;
