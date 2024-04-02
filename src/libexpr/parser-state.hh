@@ -184,18 +184,18 @@ struct StripState {
     bool start = true;
     size_t min = -1;
     size_t cur = 0;
-    bool indent(char c) {
+    inline bool indent(char c) {
         if (!start) return true;
         indentChar = indentChar.value_or(IndentChar(c));
         bool ok = (indentChar == c);
         cur += ok;
         return ok;
     }
-    void stop() {
+    inline void stop() {
         start = false;
         min = std::min(min, cur);
     }
-    void reset() {
+    inline void reset() {
         start = true;
         cur = 0;
     }
